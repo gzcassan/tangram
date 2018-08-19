@@ -79,6 +79,7 @@ export default class Scene {
         this.last_selection_render = -1;    // frame counter for last selection render pass
         this.media_capture = new MediaCapture();
         this.selection = null;
+        this.selection_enabled = (options.selection === false) ? false : true; // enable/disable feature selection for whole scene
         this.introspection = (options.introspection === true) ? true : false;
         this.resetTime();
 
@@ -195,6 +196,7 @@ export default class Scene {
 
         if (this.selection) {
             this.selection.destroy();
+            this.selection = null;
         }
 
         if (this.gl) {
@@ -528,7 +530,7 @@ export default class Scene {
             this.render_count_changed = true;
 
             this.getFeatureSelectionMapSize().then(size => {
-                if (size) { // returns undefined if previous request pending
+                if (size != null) { // returns undefined if previous request pending
                     log('info', `Scene: rendered ${this.render_count} primitives (${size} features in selection map)`);
                 }
             });
@@ -784,6 +786,10 @@ export default class Scene {
             radius = null;
         }
 
+        if (!this.selection) {
+            return Promise.resolve(null);
+        }
+
         return this.selection.getFeatureAt(point, { radius }).
             then(selection => Object.assign(selection, { pixel })).
             catch(error => Promise.resolve({ error }));
@@ -880,7 +886,7 @@ export default class Scene {
 
             // Update config (in case JS objects were manipulated directly)
             this.syncConfigToWorker({ serialize_funcs });
-            this.resetFeatureSelection(sources);
+            this.resetWorkerFeatureSelection(sources);
             this.resetTime();
 
             // Rebuild visible tiles
@@ -1125,10 +1131,28 @@ export default class Scene {
         this.gl.clearColor(...this.background.color);
     }
 
+    // Turn feature selection on/off globally for the entire scene
+    // Useful for increasing performance/memory when client knows they don't need feature selection
+    setFeatureSelection (val) {
+        if (val !== this.selection_enabled) {
+            this.selection_enabled = (val != null) ? val : true;
+            this.updating++;
+            this.resetFeatureSelection();
+            return this.updateConfig({ normalize: false })
+                .then(() => this.updating--);
+        }
+        return Promise.resolve();
+    }
+
     // Turn introspection mode on/off
     setIntrospection (val) {
         if (val !== this.introspection) {
-            this.introspection = val || false;
+            // need to turn on feature selection first
+            if (val === true && this.selection_enabled === false) {
+                return this.setFeatureSelection(true).then(() => this.setIntrospection(true));
+            }
+
+            this.introspection = (val != null) ? val : false;
             this.updating++;
             return this.updateConfig({ normalize: false }).then(() => this.updating--);
         }
@@ -1187,6 +1211,7 @@ export default class Scene {
         return WorkerBroker.postMessage(this.workers, 'self.updateConfig', {
             config: config_serialized,
             generation: this.generation,
+            selection_enabled: this.selection_enabled,
             introspection: this.introspection
         }, debugSettings);
     }
@@ -1221,10 +1246,17 @@ export default class Scene {
     }
 
     resetFeatureSelection(sources = null) {
-        if (!this.selection) {
+        if (!this.selection && this.selection_enabled === true) {
             this.selection = new FeatureSelection(this.gl, this.workers, () => this.building);
         }
-        else if (this.workers) {
+        else if (this.selection && this.selection_enabled === false) {
+            this.selection.destroy();
+            this.selection = null;
+        }
+    }
+
+    resetWorkerFeatureSelection(sources = null) {
+        if (this.workers) {
             WorkerBroker.postMessage(this.workers, 'self.resetFeatureSelection', sources);
         }
     }
